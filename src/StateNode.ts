@@ -22,7 +22,8 @@ import {
   toGuard,
   isMachine,
   toSCXMLEvent,
-  mapContext
+  mapContext,
+  toTransitionConfig
 } from './utils';
 import {
   Event,
@@ -42,7 +43,6 @@ import {
   StateTypes,
   StateNodeConfig,
   StateSchema,
-  TransitionsDefinition,
   StatesDefinition,
   StateNodesConfig,
   ActionTypes,
@@ -58,7 +58,6 @@ import {
   GuardMeta,
   MachineConfig,
   PureAction,
-  TransitionTarget,
   InvokeCreator,
   StateMachine,
   DoneEventObject,
@@ -69,7 +68,8 @@ import {
   RaiseAction,
   SCXML,
   RaiseActionObject,
-  ActivityActionObject
+  ActivityActionObject,
+  TransitionConfigTargetShortcut
 } from './types';
 import { matchesState } from './utils';
 import { State, stateValuesEqual } from './State';
@@ -236,7 +236,7 @@ class StateNode<
     initialStateValue: undefined as StateValue | undefined,
     initialState: undefined as State<TContext, TEvent> | undefined,
     transitions: undefined as
-      | TransitionsDefinition<TContext, TEvent>
+      | TransitionDefinition<TContext, TEvent>[]
       | undefined,
     delayedTransitions: undefined as
       | Array<DelayedTransitionDefinition<TContext, TEvent>>
@@ -444,6 +444,7 @@ class StateNode<
         (state: StateNode<TContext, any, TEvent>) => state.definition
       ) as StatesDefinition<TContext, TStateSchema, TEvent>,
       on: this.on,
+      transitions: this.transitions,
       onEntry: this.onEntry,
       onExit: this.onExit,
       activities: this.activities || [],
@@ -461,11 +462,11 @@ class StateNode<
   /**
    * The mapping of events to transitions.
    */
-  public get on(): TransitionsDefinition<TContext, TEvent> {
+  public get on(): Array<TransitionDefinition<TContext, TEvent>> {
+    // TODO: this also is breaking, shape has changed
     return (
-      this.__cache.transitions ||
-      ((this.__cache.transitions = this.formatTransitions()),
-      this.__cache.transitions)
+      this.__cache.on ||
+      ((this.__cache.on = this.formatTransitions()), this.__cache.on)
     );
   }
 
@@ -481,10 +482,10 @@ class StateNode<
    * All the transitions that can be taken from this state node.
    */
   public get transitions(): Array<TransitionDefinition<TContext, TEvent>> {
-    return flatten(
-      keys(this.on).map(
-        event => this.on[event] as Array<TransitionDefinition<TContext, TEvent>>
-      )
+    return (
+      this.__cache.transitions ||
+      ((this.__cache.transitions = this.formatTransitions()),
+      this.__cache.transitions)
     );
   }
 
@@ -501,88 +502,80 @@ class StateNode<
       return [];
     }
 
-    if (isArray(afterConfig)) {
-      return afterConfig.map((delayedTransition, i) => {
-        const { delay, target } = delayedTransition;
-        let delayRef: string | number;
+    const delayedTransitions = isArray(afterConfig)
+      ? afterConfig
+      : flatten(
+          keys(afterConfig).map(delay => {
+            const configTransition = afterConfig[delay];
+            const resolvedTransition = isString(configTransition)
+              ? { target: this.resolveTarget(configTransition) }
+              : configTransition;
 
-        if (isFunction(delay)) {
-          delayRef = `${this.id}:delay[${i}]`;
-          this.options.delays[delayRef] = delay; // TODO: util function
-        } else {
-          delayRef = delay;
-        }
+            return toArray(resolvedTransition).map(transition => ({
+              ...transition,
+              delay
+            }));
+          })
+        );
 
-        const eventType = after(delayRef, this.id);
+    return delayedTransitions.map((delayedTransition, i) => {
+      const { delay, target } = delayedTransition;
+      let delayRef: string | number;
 
-        this.onEntry.push(send(eventType, { delay }));
-        this.onExit.push(cancel(eventType));
+      if (isFunction(delay)) {
+        delayRef = `${this.id}:delay[${i}]`;
+        this.options.delays[delayRef] = delay; // TODO: util function
+      } else if (!isNaN(+delay)) {
+        delayRef = +delay;
+      } else {
+        delayRef = delay;
+      }
 
-        return {
-          eventType,
-          ...delayedTransition,
-          source: this,
-          target: target === undefined ? undefined : this.resolveTarget(target),
-          cond: toGuard(delayedTransition.cond, guards),
-          actions: toArray(delayedTransition.actions).map(action =>
-            toActionObject(action)
-          )
-        };
-      });
-    }
+      const eventType = after(delayRef, this.id);
 
-    const allDelayedTransitions = flatten<
-      DelayedTransitionDefinition<TContext, TEvent>
-    >(
-      keys(afterConfig).map(delayKey => {
-        const delayedTransition = (afterConfig as Record<
-          string,
-          | TransitionConfig<TContext, TEvent>
-          | Array<TransitionConfig<TContext, TEvent>>
-        >)[delayKey];
+      // TODO: check if using delayRef here (instead of delay) has fixed a bug
+      this.onEntry.push(send(eventType, { delay: delayRef }));
+      this.onExit.push(cancel(eventType));
 
-        const delay = isNaN(+delayKey) ? delayKey : +delayKey;
-        const eventType = after(delay, this.id);
+      return {
+        eventType,
+        ...delayedTransition,
+        source: this,
+        target: target === undefined ? undefined : this.resolveTarget(target),
+        cond: toGuard(delayedTransition.cond, guards),
+        actions: toArray(delayedTransition.actions).map(action =>
+          toActionObject(action)
+        )
+      };
+    });
 
-        this.onEntry.push(send<TContext, TEvent>(eventType, { delay }));
-        this.onExit.push(cancel(eventType));
+    //     if (isString(delayedTransition)) {
+    //       return [
+    //         {
+    //         }
+    //       ];
+    //     }
 
-        if (isString(delayedTransition)) {
-          return [
-            {
-              source: this,
-              target: this.resolveTarget(delayedTransition),
-              delay,
-              eventType,
-              actions: []
-            }
-          ];
-        }
+    //     const delayedTransitions = toArray(delayedTransition);
 
-        const delayedTransitions = toArray(delayedTransition);
+    //     return delayedTransitions.map(transition => ({
+    //       event,
+    //       delay,
+    //       ...transition,
+    //       source: this,
+    //       target:
+    //         transition.target === undefined
+    //           ? transition.target
+    //           : this.resolveTarget(transition.target),
+    //       cond: toGuard(transition.cond, guards),
+    //       actions: toArray(transition.actions).map(action =>
+    //         toActionObject(action)
+    //       )
+    //     }));
+    //   })
+    // );
 
-        return delayedTransitions.map(transition => ({
-          eventType,
-          delay,
-          ...transition,
-          source: this,
-          target:
-            transition.target === undefined
-              ? transition.target
-              : this.resolveTarget(transition.target),
-          cond: toGuard(transition.cond, guards),
-          actions: toArray(transition.actions).map(action =>
-            toActionObject(action)
-          )
-        }));
-      })
-    );
-
-    allDelayedTransitions.sort((a, b) =>
-      isString(a) || isString(b) ? 0 : +a.delay - +b.delay
-    );
-
-    return allDelayedTransitions;
+    // return allDelayedTransitions;
   }
 
   /**
@@ -765,24 +758,27 @@ class StateNode<
     state: State<TContext, TEvent>,
     _event: SCXML.Event<TEvent>
   ): StateTransition<TContext, TEvent> | undefined {
-    const eventName = _event.name;
-    const candidates = this.on[eventName as TEvent['type']] || [];
-    const hasWildcard = this.on[WILDCARD];
+    const eventName = _event.name as TEvent['type'];
+    // const candidates = this.on.find(transitionDef => transitionDef.event === );
+    // const hasWildcard = this.on[WILDCARD];
 
-    if (!candidates.length && !hasWildcard) {
-      return undefined;
-    }
+    // if (!candidates.length && !hasWildcard) {
+    //   return undefined;
+    // }
 
     const actions: Array<ActionObject<TContext, TEvent>> = [];
 
     let nextStateNodes: Array<StateNode<TContext>> = [];
     let selectedTransition: TransitionDefinition<TContext, TEvent> | undefined;
 
-    const allCandidates = hasWildcard
-      ? candidates.concat(this.on['*'])
-      : candidates;
+    // const allCandidates = hasWildcard
+    //   ? candidates.concat(this.on['*'])
+    //   : candidates;
 
-    for (const candidate of allCandidates) {
+    for (const candidate of this.on) {
+      if (candidate.eventType !== eventName && candidate.eventType !== '*') {
+        continue;
+      }
       const { cond, in: stateIn } = candidate;
       const resolvedContext = state.context;
 
@@ -1818,16 +1814,15 @@ class StateNode<
    */
   public get ownEvents(): Array<TEvent['type']> {
     const events = new Set(
-      keys(this.on).filter(key => {
-        const transitions = this.on[key];
-        return transitions.some(transition => {
+      this.on
+        .filter(transition => {
           return !(
             !transition.target &&
             !transition.actions.length &&
             transition.internal
           );
-        });
-      })
+        })
+        .map(transition => transition.eventType)
     );
 
     return Array.from(events);
@@ -1873,12 +1868,12 @@ class StateNode<
   }
 
   private formatTransition(
-    target: TransitionTarget<TContext> | undefined,
-    transitionConfig: TransitionConfig<TContext, TEvent> | undefined,
-    event: string
+    event: string,
+    transitionConfig: TransitionConfig<TContext, TEvent>
   ): TransitionDefinition<TContext, TEvent> {
-    let internal = transitionConfig ? transitionConfig.internal : undefined;
-    const targets = toArray(target);
+    let internal =
+      'internal' in transitionConfig ? transitionConfig.internal : undefined;
+    const targets = toArray(transitionConfig.target);
     const { guards } = this.machine.options;
 
     // Format targets to their full string path
@@ -1916,19 +1911,21 @@ class StateNode<
       }
     });
 
-    if (transitionConfig === undefined) {
-      return {
-        target: target === undefined ? undefined : formattedTargets,
-        source: this,
-        actions: [],
-        internal: target === undefined || internal,
-        eventType: event
-      };
-    }
+    // if (transitionConfig === undefined) {
+    //   return {
+    //     target: target === undefined ? undefined : formattedTargets,
+    //     source: this,
+    //     actions: [],
+    //     internal: target === undefined || internal,
+    //     eventType: event
+    //   };
+    // }
 
     // Check if there is no target (targetless)
     // An undefined transition signals that the state node should not transition from that event.
-    const isTargetless = target === undefined || target === TARGETLESS_KEY;
+    const isTargetless =
+      transitionConfig.target === undefined ||
+      transitionConfig.target === TARGETLESS_KEY;
 
     return {
       ...transitionConfig,
@@ -1940,108 +1937,147 @@ class StateNode<
       eventType: event
     };
   }
-  private formatTransitions(): TransitionsDefinition<TContext, TEvent> {
-    const onConfig = this.config.on;
+  private formatTransitions(): TransitionDefinition<TContext, TEvent>[] {
+    const validateMappedTransitions = (
+      transitions: Array<TransitionConfig<TContext, TEvent>>,
+      event: string
+    ) => {
+      const hasNonLastUnguardedTarget = transitions
+        .slice(0, -1)
+        .some(
+          transition =>
+            isString(transition.target) ||
+            isMachine(transition.target) ||
+            (!('cond' in transition) && !('in' in transition))
+        );
+
+      const eventText =
+        event.length === 0 ? 'the transient event' : `event '${event}'`;
+
+      warn(
+        !hasNonLastUnguardedTarget,
+        `One or more transitions for ${eventText} on state '${this.id}' are unreachable. ` +
+          `Make sure that the default transition is the last one defined.`
+      );
+    };
+
+    const onConfig = !this.config.on
+      ? []
+      : Array.isArray(this.config.on)
+      ? this.config.on
+      : flatten(
+          keys(this.config.on).map(key => {
+            const transitions = toArray(this.config.on![
+              key as string
+            ] as SingleOrArray<
+              | TransitionConfig<TContext, TEvent>
+              | TransitionConfigTargetShortcut<TContext, TEvent>
+            >).map(toTransitionConfig);
+
+            if (!IS_PRODUCTION) {
+              validateMappedTransitions(transitions, key);
+            }
+
+            return transitions.map(transition => ({
+              ...transition,
+              event: key
+            }));
+          })
+        );
+
     const doneConfig = this.config.onDone
-      ? {
-          [`${done(this.id)}`]: this.config.onDone
-        }
-      : undefined;
-    const invokeConfig = this.invoke.reduce(
-      (acc, invokeDef) => {
+      ? [{ event: String(done(this.id)), config: this.config.onDone }]
+      : [];
+
+    const invokeConfig = flatten(
+      this.invoke.map(invokeDef => {
+        const settleTransitions: any[] = [];
         if (invokeDef.onDone) {
-          acc[doneInvoke(invokeDef.id)] = invokeDef.onDone;
+          settleTransitions.push({
+            event: String(doneInvoke(invokeDef.id)),
+            config: invokeDef.onDone
+          });
         }
         if (invokeDef.onError) {
-          acc[error(invokeDef.id)] = invokeDef.onError;
+          settleTransitions.push({
+            event: String(error(invokeDef.id)),
+            config: invokeDef.onError
+          });
         }
-        return acc;
-      },
-      {} as any
+        return settleTransitions;
+      })
     );
 
     const delayedTransitions = this.after;
 
-    const formattedTransitions: TransitionsDefinition<
-      TContext,
-      TEvent
-    > = mapValues(
-      { ...onConfig, ...doneConfig, ...invokeConfig },
-      (
-        value:
-          | TransitionConfig<TContext, TEvent>
-          | string
-          | StateMachine<any, any, any>
-          | undefined,
-        event
-      ) => {
-        if (value === undefined) {
-          return [
-            { target: undefined, eventType: event, actions: [], internal: true }
-          ];
-        }
-
-        const transitions = toArray(value);
-
-        if (!IS_PRODUCTION) {
-          const hasNonLastUnguardedTarget = transitions
-            .slice(0, -1)
-            .some(
-              transition =>
-                isString(transition) ||
-                isMachine(transition) ||
-                (!('cond' in transition) && !('in' in transition))
-            );
-
-          const eventText =
-            event.length === 0 ? 'the transient event' : `event '${event}'`;
-
-          warn(
-            !hasNonLastUnguardedTarget,
-            `One or more transitions for ${eventText} on state '${this.id}' are unreachable. ` +
-              `Make sure that the default transition is the last one defined.`
-          );
-        }
-
-        return transitions.map(transition => {
-          if (isString(transition) || isMachine(transition)) {
-            return this.formatTransition(transition, undefined, event);
+    let formattedTransitions = flatten(
+      [...onConfig, ...doneConfig, ...invokeConfig].map(
+        (transitionDefinition: {
+          event: string;
+          config:
+            | TransitionConfig<TContext, TEvent>
+            | string
+            | StateMachine<any, any, any>
+            | undefined;
+        }) => {
+          if (transitionDefinition.config === undefined) {
+            const stopBubblingDefinition: TransitionDefinition<
+              TContext,
+              TEvent
+            > = {
+              target: undefined,
+              source: this,
+              eventType: transitionDefinition.event,
+              actions: [],
+              internal: true
+            };
+            return [stopBubblingDefinition];
           }
 
-          if (!IS_PRODUCTION) {
-            for (const key of keys(transition)) {
-              if (
-                [
-                  'target',
-                  'actions',
-                  'internal',
-                  'in',
-                  'cond',
-                  'event'
-                ].indexOf(key) === -1
-              ) {
-                throw new Error(
-                  // tslint:disable-next-line:max-line-length
-                  `State object mapping of transitions is deprecated. Check the config for event '${event}' on state '${this.id}'.`
-                );
+          const transitions = toArray(transitionDefinition.config);
+
+          return transitions.map(transition => {
+            if (isString(transition) || isMachine(transition)) {
+              return this.formatTransition(transitionDefinition.event, {
+                target: transition
+              });
+            }
+
+            if (!IS_PRODUCTION) {
+              for (const key of keys(transition)) {
+                if (
+                  [
+                    'target',
+                    'actions',
+                    'internal',
+                    'in',
+                    'cond',
+                    'event'
+                  ].indexOf(key) === -1
+                ) {
+                  throw new Error(
+                    // tslint:disable-next-line:max-line-length
+                    `State object mapping of transitions is deprecated. Check the config for event '${transitionDefinition.event}' on state '${this.id}'.`
+                  );
+                }
               }
             }
-          }
 
-          return this.formatTransition(transition.target, transition, event);
-        });
-      }
-    ) as TransitionsDefinition<TContext, TEvent>;
+            return this.formatTransition(
+              transitionDefinition.event,
+              transition
+            );
+          });
+        }
+      )
+    );
 
     for (const delayedTransition of delayedTransitions) {
-      formattedTransitions[delayedTransition.eventType] =
-        formattedTransitions[delayedTransition.eventType] || [];
-      formattedTransitions[delayedTransition.eventType].push(
-        delayedTransition as TransitionDefinition<
-          TContext,
-          TEvent | EventObject
-        >
-      );
+      // formattedTransitions.push(delayedTransition as TransitionDefinition<
+      //   TContext,
+      //   TEvent | EventObject
+      // >);
+      formattedTransitions.push(delayedTransition as any);
     }
 
     return formattedTransitions;

@@ -16,11 +16,13 @@ import {
   ConditionPredicate,
   SCXML,
   StateLike,
-  EventData
+  EventData,
+  TransitionConfig
 } from './types';
 import { STATE_DELIMITER, DEFAULT_GUARD_TYPE } from './constants';
 import { IS_PRODUCTION } from './environment';
 import { State } from '.';
+import { config } from 'shelljs';
 
 export function keys<T extends object>(value: T): Array<keyof T & string> {
   return Object.keys(value) as Array<keyof T & string>;
@@ -552,4 +554,22 @@ export function toSCXMLEvent<TEvent extends EventObject>(
     type: 'external',
     ...scxmlEvent
   };
+}
+
+export function toTransitionConfig<TContext, TEvent extends EventObject>(
+  configLike:
+    | TransitionConfig<TContext, TEvent>
+    | string
+    | number
+    | StateMachine<any, any, any>
+    | undefined
+): TransitionConfig<TContext, TEvent> {
+  if (
+    configLike === undefined ||
+    isString(configLike) ||
+    isMachine(configLike)
+  ) {
+    return { target: configLike };
+  }
+  return configLike;
 }
